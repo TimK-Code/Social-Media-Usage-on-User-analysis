@@ -1,1 +1,211 @@
+---
+title: "DoomScroll Analysis"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+```
+
+```{r load-data, message=FALSE, warning=FALSE}
+set.seed(42)
+insta_full  <- read.csv("instagram_users_lifestyle.csv")
+insta       <- insta_full[sample(nrow(insta_full), min(100000, nrow(insta_full))), ]
+insta_clean <- insta[, !names(insta) %in% c("user_id", "app_name", "last_login_date")]
+insta_clean <- na.omit(insta_clean)
+```
+
+---
+
+## LASSO Regression
+
+```{r lasso-fit}
+x <- model.matrix(self_reported_happiness ~ ., data = insta_clean)[, -1]
+y <- insta_clean$self_reported_happiness
+
+set.seed(42)
+cv_model    <- cv.glmnet(x, y, alpha = 1)
+best_lambda <- cv_model$lambda.min
+final_lasso <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+
+lasso_coefs <- as.matrix(coef(final_lasso))
+lasso_df <- data.frame(
+  Variable    = rownames(lasso_coefs),
+  Coefficient = as.numeric(lasso_coefs)
+) %>%
+  filter(Variable != "(Intercept)", Coefficient != 0) %>%
+  arrange(Coefficient)
+```
+
+### Graph 1 — LASSO: Lambda Selection
+
+```{r plot-lasso-cv, fig.width=8, fig.height=5}
+cv_df <- data.frame(
+  log_lambda = log(cv_model$lambda),
+  cvm        = cv_model$cvm,
+  cvup       = cv_model$cvup,
+  cvlo       = cv_model$cvlo
+)
+
+ggplot(cv_df, aes(x = log_lambda, y = cvm)) +
+  geom_ribbon(aes(ymin = cvlo, ymax = cvup), fill = "#4E79A7", alpha = 0.2) +
+  geom_line(color = "#4E79A7", linewidth = 1) +
+  geom_vline(xintercept = log(best_lambda), linetype = "dashed",
+             color = "red", linewidth = 0.9) +
+  annotate("text", x = log(best_lambda), y = max(cv_df$cvup),
+           label = paste0("Best lambda = ", round(best_lambda, 4)),
+           hjust = -0.1, color = "red", size = 4.5) +
+  labs(
+    title    = "LASSO: Cross-Validated MSE vs. Lambda",
+    subtitle = "Optimal lambda selected at minimum cross-validated error",
+    x        = "log(Lambda)",
+    y        = "Mean Squared Error (CV)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "gray40")
+  )
+```
+
+### Graph 2 — LASSO: Selected Coefficients
+
+```{r plot-lasso-coefs, fig.width=8, fig.height=5}
+ggplot(lasso_df, aes(x = reorder(Variable, Coefficient),
+                     y = Coefficient, fill = Coefficient > 0)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("TRUE" = "#4E79A7", "FALSE" = "#F28E2B"),
+    labels = c("TRUE" = "Positive", "FALSE" = "Negative")
+  ) +
+  coord_flip() +
+  labs(
+    title    = "LASSO: Variables Selected and Their Coefficients",
+    subtitle = paste0("Lambda = ", round(best_lambda, 4),
+                      " | Variables shrunk to zero are excluded"),
+    x        = "Predictor",
+    y        = "Coefficient",
+    fill     = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    plot.subtitle   = element_text(color = "gray40"),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+## Multiple Linear Regression
+
+```{r mlr-fit}
+selected_vars <- lasso_df$Variable
+selected_vars <- selected_vars[selected_vars %in% colnames(insta_clean)]
+
+mlr_formula <- as.formula(
+  paste("self_reported_happiness ~", paste(selected_vars, collapse = " + "))
+)
+mlr_model   <- lm(mlr_formula, data = insta_clean)
+mlr_summary <- summary(mlr_model)
+```
+
+### Graph 3 — MLR: Coefficient Estimates
+
+```{r plot-mlr-coefs, fig.width=8, fig.height=5}
+mlr_coefs <- as.data.frame(mlr_summary$coefficients)
+mlr_coefs$Variable    <- rownames(mlr_coefs)
+mlr_coefs$Significant <- mlr_coefs$`Pr(>|t|)` < 0.05
+mlr_coefs <- filter(mlr_coefs, Variable != "(Intercept)")
+
+ggplot(mlr_coefs, aes(x = reorder(Variable, Estimate),
+                      y = Estimate, fill = Significant)) +
+  geom_col() +
+  geom_errorbar(
+    aes(ymin = Estimate - 1.96 * `Std. Error`,
+        ymax = Estimate + 1.96 * `Std. Error`),
+    width = 0.3, color = "gray30"
+  ) +
+  scale_fill_manual(
+    values = c("TRUE" = "#4E79A7", "FALSE" = "#BAB0AC"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05")
+  ) +
+  coord_flip() +
+  labs(
+    title    = "MLR: Coefficient Estimates with 95% Confidence Intervals",
+    subtitle = "Only LASSO-selected variables included | Blue = statistically significant",
+    x        = "Predictor",
+    y        = "Coefficient Estimate",
+    fill     = "Significance"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    plot.subtitle   = element_text(color = "gray40"),
+    legend.position = "bottom"
+  )
+```
+
+### Graph 4 — MLR: Actual vs. Predicted
+
+```{r plot-mlr-actual-vs-pred, fig.width=8, fig.height=5}
+set.seed(42)
+plot_idx <- sample(nrow(insta_clean), min(5000, nrow(insta_clean)))
+
+pred_df <- data.frame(
+  Actual    = insta_clean$self_reported_happiness[plot_idx],
+  Predicted = fitted(mlr_model)[plot_idx]
+)
+
+ggplot(pred_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.15, size = 0.7, color = "#4E79A7") +
+  geom_abline(slope = 1, intercept = 0, color = "red",
+              linetype = "dashed", linewidth = 0.9) +
+  labs(
+    title    = "MLR: Actual vs. Predicted Happiness",
+    subtitle = paste0("R-squared = ", round(mlr_summary$r.squared, 3),
+                      " | Red line = perfect prediction | n = 5,000 plotted"),
+    x        = "Actual Happiness Score",
+    y        = "Predicted Happiness Score"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "gray40")
+  )
+```
+
+
+
+```{r plot-mlr-coefs, fig.width=8, fig.height=max(5, n_mlr * 0.45)}
+ggplot(mlr_coefs, aes(x = reorder(Variable, Estimate),
+                      y = Estimate, fill = Significant)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(
+    aes(ymin = Estimate - 1.96 * `Std. Error`,
+        ymax = Estimate + 1.96 * `Std. Error`),
+    width = 0.25, color = "gray30"
+  ) +
+  scale_fill_manual(
+    values = c("TRUE" = "#4E79A7", "FALSE" = "#BAB0AC"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05")
+  ) +
+  scale_x_discrete(expand = expansion(add = 0.8)) +
+  coord_flip() +
+  labs(
+    title = "MLR: Coefficient Estimates with 95% Confidence Intervals",
+    x     = NULL,
+    y     = "Coefficient Estimate",
+    fill  = "Significance"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    axis.text.y     = element_text(size = 12, margin = margin(r = 6)),
+    legend.position = "bottom"
+  )
+```
+
 
