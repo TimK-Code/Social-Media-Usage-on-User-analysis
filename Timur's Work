@@ -1,1 +1,422 @@
 
+---
+title: "STAT 472 — Random Forest Analysis"
+subtitle: "The Impact of Instagram Engagement Patterns on Well-being"
+author: "Rohan, Sam, Timur"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+---
+
+# Overview
+
+This report fits a **Random Forest** regression model to the *Social Media User
+Analysis* dataset (Kaggle, 1.5 M synthetic profiles) as a complement to the baseline
+Multiple Linear Regression described in the project proposal.  The goal is to predict
+two response variables:
+
+| Response Variable | Description |
+|---|---|
+| `self_reported_happiness` | Self-reported happiness score (1–10) |
+| `perceived_stress_score` | Perceived stress score (0–40) |
+
+The **primary predictor of interest** is `time_on_explore_per_day` — the minutes per
+day spent on Instagram's Explore page — used as a proxy for passive, comparison-driven
+browsing ("doom-scrolling").  Demographic and lifestyle variables are included as
+confounding controls.
+
+---
+
+# Setup
+
+## Load Libraries
+
+```{r libraries}
+library(randomForest)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(data.table)
+```
+
+---
+
+# Data
+
+## Load Dataset
+
+The full CSV contains ~1.55 M rows.  We draw a stratified random sample of
+**50,000 rows** for model training and evaluation — large enough to capture the
+population structure while keeping computation tractable.
+
+```{r load-data}
+set.seed(472)
+
+DATA_PATH <- "instagram_usage_lifestyle.csv"
+
+NEEDED_COLS <- c(
+  "time_on_explore_per_day",
+  "daily_active_minutes_instagram",
+  "time_on_reels_per_day",
+  "time_on_feed_per_day",
+  "sessions_per_day",
+  "reels_watched_per_day",
+  "stories_viewed_per_day",
+  "average_session_length_minutes",
+  "age", "gender", "income_level", "urban_rural",
+  "exercise_hours_per_week", "sleep_hours_per_night",
+  "self_reported_happiness", "perceived_stress_score"
+)
+
+# data.table::fread reads only the selected columns — ~10x faster than read.csv
+dt_full <- fread(DATA_PATH, select = NEEDED_COLS)
+cat("Full dataset (selected cols):", nrow(dt_full), "rows x", ncol(dt_full), "cols\n")
+
+# Draw a random sample of 50,000 rows
+set.seed(472)
+sample_idx <- sample(nrow(dt_full), size = 10000, replace = FALSE)
+df_raw     <- as.data.frame(dt_full[sample_idx])
+
+cat("Working sample:          ", nrow(df_raw), "rows (sampled from", nrow(dt_full), "total)\n")
+```
+
+## Variable Selection & Cleaning
+
+```{r clean}
+FEATURES <- c(
+  # ── Primary predictor ──────────────────────────────────────────────────────
+  "time_on_explore_per_day",
+  # ── Additional Instagram usage ─────────────────────────────────────────────
+  "daily_active_minutes_instagram",
+  "time_on_reels_per_day",
+  "time_on_feed_per_day",
+  "sessions_per_day",
+  "reels_watched_per_day",
+  "stories_viewed_per_day",
+  "average_session_length_minutes",
+  # ── Demographic controls ───────────────────────────────────────────────────
+  "age",
+  "gender",
+  "income_level",
+  "urban_rural",
+  # ── Lifestyle controls ─────────────────────────────────────────────────────
+  "exercise_hours_per_week",
+  "sleep_hours_per_night"
+)
+
+RESPONSES <- c("self_reported_happiness", "perceived_stress_score")
+
+df <- df_raw %>%
+  select(all_of(c(FEATURES, RESPONSES))) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  drop_na()
+
+cat("Modelling dataset:", nrow(df), "rows,", ncol(df), "columns\n")
+```
+
+## Quick Summary
+
+```{r summary}
+df %>%
+  select(self_reported_happiness, perceived_stress_score,
+         time_on_explore_per_day, sleep_hours_per_night,
+         exercise_hours_per_week) %>%
+  summary()
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Distribution of Response Variables
+
+```{r eda-responses, fig.height=4}
+df %>%
+  select(self_reported_happiness, perceived_stress_score) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  mutate(variable = recode(variable,
+    "self_reported_happiness" = "Happiness Score (1–10)",
+    "perceived_stress_score"  = "Stress Score (0–40)")) %>%
+  ggplot(aes(x = value, fill = variable)) +
+  geom_histogram(bins = 35, colour = "white", alpha = 0.85) +
+  facet_wrap(~variable, scales = "free") +
+  scale_fill_manual(values = c("#1976D2", "#D32F2F")) +
+  labs(title = "Distribution of Response Variables",
+       x = "Score", y = "Count") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Explore-Page Time vs. Well-being
+
+```{r eda-scatter, fig.height=4}
+df %>%
+  select(time_on_explore_per_day, self_reported_happiness, perceived_stress_score) %>%
+  slice_sample(n = 5000) %>%          # thin for plot clarity
+  pivot_longer(-time_on_explore_per_day, names_to = "outcome", values_to = "score") %>%
+  mutate(outcome = recode(outcome,
+    "self_reported_happiness" = "Happiness Score",
+    "perceived_stress_score"  = "Stress Score")) %>%
+  ggplot(aes(x = time_on_explore_per_day, y = score, colour = outcome)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  facet_wrap(~outcome, scales = "free_y") +
+  scale_colour_manual(values = c("#1976D2", "#D32F2F")) +
+  labs(title = "Explore-Page Time vs. Well-being Outcomes",
+       x = "Time on Explore Page (min/day)", y = "Score") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Well-being by Gender
+
+```{r eda-gender, fig.height=4}
+df %>%
+  select(gender, self_reported_happiness, perceived_stress_score) %>%
+  pivot_longer(-gender, names_to = "outcome", values_to = "score") %>%
+  mutate(outcome = recode(outcome,
+    "self_reported_happiness" = "Happiness Score",
+    "perceived_stress_score"  = "Stress Score")) %>%
+  ggplot(aes(x = gender, y = score, fill = gender)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.4) +
+  facet_wrap(~outcome, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Well-being Scores by Gender",
+       x = NULL, y = "Score") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+---
+
+# Random Forest Models
+
+Two separate Random Forest regression models are trained — one per response variable —
+using an **80 / 20 train–test split** and **`ntree = 300`** trees.  The default
+`mtry = floor(p/3)` is used for regression forests.
+
+## Train / Test Split
+
+```{r split}
+set.seed(472)
+n_total   <- nrow(df)
+train_idx <- sample(seq_len(n_total), size = floor(0.80 * n_total))
+
+train <- df[ train_idx, ]
+test  <- df[-train_idx, ]
+
+cat("Training rows:", nrow(train), " | Test rows:", nrow(test), "\n")
+```
+
+## Model 1 — Predicting Happiness Score
+
+```{r rf-happiness}
+set.seed(472)
+
+feat_cols <- intersect(FEATURES, colnames(df))
+
+rf_happiness <- randomForest(
+  x          = train[, feat_cols],
+  y          = train$self_reported_happiness,
+  ntree      = 200,
+  importance = TRUE
+)
+
+print(rf_happiness)
+```
+
+### Test-Set Performance
+
+```{r perf-happiness}
+pred_happiness <- predict(rf_happiness, newdata = test[, feat_cols])
+
+rmse_h <- sqrt(mean((test$self_reported_happiness - pred_happiness)^2))
+mae_h  <- mean(abs(test$self_reported_happiness   - pred_happiness))
+ss_res <- sum((test$self_reported_happiness - pred_happiness)^2)
+ss_tot <- sum((test$self_reported_happiness - mean(test$self_reported_happiness))^2)
+r2_h   <- 1 - ss_res / ss_tot
+
+cat(sprintf("Happiness Model  |  RMSE: %.3f  |  MAE: %.3f  |  R²: %.3f\n",
+            rmse_h, mae_h, r2_h))
+```
+
+## Model 2 — Predicting Stress Score
+
+```{r rf-stress}
+set.seed(472)
+
+rf_stress <- randomForest(
+  x          = train[, feat_cols],
+  y          = train$perceived_stress_score,
+  ntree      = 200,
+  importance = TRUE
+)
+
+print(rf_stress)
+```
+
+### Test-Set Performance
+
+```{r perf-stress}
+pred_stress <- predict(rf_stress, newdata = test[, feat_cols])
+
+rmse_s   <- sqrt(mean((test$perceived_stress_score - pred_stress)^2))
+mae_s    <- mean(abs(test$perceived_stress_score   - pred_stress))
+ss_res_s <- sum((test$perceived_stress_score - pred_stress)^2)
+ss_tot_s <- sum((test$perceived_stress_score - mean(test$perceived_stress_score))^2)
+r2_s     <- 1 - ss_res_s / ss_tot_s
+
+cat(sprintf("Stress Model     |  RMSE: %.3f  |  MAE: %.3f  |  R²: %.3f\n",
+            rmse_s, mae_s, r2_s))
+```
+
+---
+
+# Variable Importance
+
+**`%IncMSE`** measures the average increase in Mean Squared Error when a variable's
+values are randomly permuted across out-of-bag samples.  A larger value indicates
+greater importance to predictive accuracy.
+
+## Happiness Model
+
+```{r imp-happiness, fig.height=5}
+imp_h <- importance(rf_happiness, type = 1) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  rename(IncMSE = `%IncMSE`) %>%
+  arrange(desc(IncMSE))
+
+ggplot(imp_h, aes(x = reorder(Variable, IncMSE), y = IncMSE, fill = IncMSE)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(low = "#90CAF9", high = "#0D47A1") +
+  labs(title = "Variable Importance — Happiness Score",
+       subtitle = "Metric: % Increase in MSE when variable is permuted (OOB)",
+       x = NULL, y = "% Increase in MSE") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Stress Model
+
+```{r imp-stress, fig.height=5}
+imp_s <- importance(rf_stress, type = 1) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  rename(IncMSE = `%IncMSE`) %>%
+  arrange(desc(IncMSE))
+
+ggplot(imp_s, aes(x = reorder(Variable, IncMSE), y = IncMSE, fill = IncMSE)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(low = "#FFCDD2", high = "#B71C1C") +
+  labs(title = "Variable Importance — Stress Score",
+       subtitle = "Metric: % Increase in MSE when variable is permuted (OOB)",
+       x = NULL, y = "% Increase in MSE") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+---
+
+# Model Diagnostics
+
+## Predicted vs. Actual
+
+```{r diag-plots, fig.height=4}
+diag_df <- data.frame(
+  actual    = c(test$self_reported_happiness, test$perceived_stress_score),
+  predicted = c(pred_happiness, pred_stress),
+  model     = rep(c("Happiness Score", "Stress Score"), each = nrow(test))
+)
+
+ggplot(diag_df, aes(x = actual, y = predicted, colour = model)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "black", linewidth = 0.8) +
+  facet_wrap(~model, scales = "free") +
+  scale_colour_manual(values = c("#1565C0", "#C62828")) +
+  labs(title = "Predicted vs. Actual Values — Test Set",
+       x = "Actual Score", y = "Predicted Score") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## OOB Error vs. Number of Trees
+
+```{r oob-plot, fig.height=4}
+oob_df <- data.frame(
+  trees     = seq_len(rf_happiness$ntree),
+  Happiness = rf_happiness$mse,
+  Stress    = rf_stress$mse
+) %>%
+  pivot_longer(-trees, names_to = "Model", values_to = "OOB_MSE")
+
+ggplot(oob_df, aes(x = trees, y = OOB_MSE, colour = Model)) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = c("#1565C0", "#C62828")) +
+  labs(title = "OOB Error vs. Number of Trees",
+       x = "Number of Trees", y = "OOB MSE", colour = "Model") +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Results Summary
+
+```{r results-table, echo=FALSE}
+results <- data.frame(
+  Model     = c("Happiness Score", "Stress Score"),
+  RMSE      = round(c(rmse_h, rmse_s), 3),
+  MAE       = round(c(mae_h,  mae_s),  3),
+  R_squared = round(c(r2_h,   r2_s),   3)
+)
+knitr::kable(
+  results,
+  col.names = c("Response Variable", "RMSE", "MAE", "R²"),
+  caption   = "Table 1. Random Forest Test-Set Performance (n = 2,000 test rows)"
+)
+```
+
+---
+
+# Interpretation & Next Steps
+
+The variable importance plots directly address the project's core research question:
+if **`time_on_explore_per_day`** ranks among the top predictors of both happiness and
+stress, this provides evidence that passive, comparison-driven browsing is a meaningful
+driver of well-being beyond general screen time.  Lifestyle variables such as
+`sleep_hours_per_night` and `exercise_hours_per_week` serve as important confounders
+whose relative importance can be compared directly.
+
+**Next steps for the full project:**
+
+1. Run the baseline **Multiple Linear Regression** and compare its R² to the Random Forest R² to quantify the non-linear signal captured by the ensemble.
+2. Apply **LASSO / Ridge regression** for variable selection across all 57 predictors.
+3. Investigate **interaction terms** (e.g., `time_on_explore_per_day × gender`) in the MLR framework to address the second research question.
+4. Consider **partial dependence plots** to visualise the marginal effect of `time_on_explore_per_day` while averaging over all other predictors.
+
+---
+
+*Dataset: Social Media User Analysis — Kaggle (rockyt07). Synthetic data, MIT License.*
